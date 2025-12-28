@@ -8,7 +8,9 @@ from pathlib import Path
 import re
 import pickle
 import multiprocessing
-
+import clang.cindex
+import ctypes
+import os
 
 # Right now this only mutes include errors that don't break everything
 CLEAN_PRINT = True
@@ -25,6 +27,14 @@ def emergency_shutdown():
 	return
 
 class _MyBreak(Exception): pass
+
+
+class CXSourceRangeList(ctypes.Structure):
+	_fields_ = [("count", ctypes.c_uint),("ranges", ctypes.POINTER(clang.cindex.SourceRange))]
+
+CXSourceRangeList_P = ctypes.POINTER(CXSourceRangeList)
+
+
 
 ########### DB UTILS ###########
 def connect_sql():
@@ -56,8 +66,20 @@ def selectdb(db, sql):
 	db[1].execute(sql)
 	return
 ########### DB UTILS ###########
+class Change_Set:
+	def __init__(self, file_name):
+		self.file_name = file_name
+		self.cs = []
+		self.cs_processed = False
+		self.cs_result = []
+		self.cs_result_dict = {}
+		self.includes = []
+		self.tags = []
+		self.tags_processed = False
+	def __call__(self, *item):
+		return self.cs.append(*item)
 
-class Great_Processor(deque):
+class Great_Processor:
 	def __init__(self):
 		global multi_proc
 		multi_proc = False
@@ -67,8 +89,10 @@ class Great_Processor(deque):
 		self.vid = 0
 		self.manager = None
 		self.shared_set_list = None
+		self.main_dict = {}
 
 	def __getstate__(self):
+		#useless
 		# Copy the object's state from self.__dict__ which contains
 		# all our instance attributes. Always use the dict.copy()
 		# method to avoid modifying the original state.
@@ -256,45 +280,127 @@ class Great_Processor(deque):
 		return
 
 	def push_set_to_main(self):
-		self.shared_set_list.append(pickle.dumps(gp))
+		self.shared_set_list.append(pickle.dumps(gp.main_dict))
 		return
 
 	def set(self, *args):
 		self.append(args)
 		return
 
+
+
 	def execute(self):
+		# doesn't include tags
 		global multi_proc
 		multi_proc = False
-		while self:
+		for CS in self.main_dict.values():
 			x = []
-			for item in self.popleft():
+			for item in CS.cs:
 				while item.__class__.__name__ == "Delayed_Executor":
-					item = item.process(x)
-				x.append(item)
+					item = item.process(CS.cs_result)
+				CS.cs_result.append(item)
+
+				if not CS.cs_result_dict.get(item.__class__.__name__):
+					CS.cs_result_dict[item.__class__.__name__] = []
+				CS.cs_result_dict[item.__class__.__name__].append(item)
+
+			CS.cs_processed = True
 			#print(f"execute() results:{x}")
 		return
 
 	def execute_all(self):
 		print("Great_Processor.execute() start")
-		self.execute()
-		count = 0
 		if len(self.shared_set_list) != CPUS-1:
 			print(f"You have {len(self.shared_set_list)} set_list. We need {CPUS-1}!!! Exiting now!")
 			emergency_shutdown()
 		for remote_gp in self.shared_set_list:
-			print(f"gp:{count}")
-			pickle.loads(remote_gp).execute()
-			count += 1
+			self.main_dict.update(pickle.loads(remote_gp))
+		self.execute()
 
+		#self.handling_tags()
+		self.main_dict = {}
 		print("Great_Processor.execute_all() done")
 		return
+
+	def get_on_fname(self, fname, table, only_first=True):
+		# Will return the table entry(ies) given a fname and table. Will look in currently processed CS and, if not found, search db for prior version
+		#####NEEDS TO BE FIXED AS IT MAY RETURN MORE THAN EXPECTED AS WE DO GET_SET ON RANDOM THINGS..... (FOR THE MAIN_DICT PART...)
+		if self.main_dict.get(fname):
+			if (result := self.main_dict[fname].cs_result_dict.get(table)):
+				if only_first:
+					return result[0]
+				else:
+					return result
+
+		if not (fn := m_file_name.get(m_file_name.fname(fname))):
+			return None
+		if table == "m_file_name":
+			return fn
+
+
+		if not (mbf := m_bridge_file.get(m_bridge_file.vid(self.old_vid), m_bridge_file.fnid(fn.fnid))):
+			return None
+		if table == "m_bridge_file":
+			return mbf
+
+		if table == "m_file":
+			return m_file.get(m_file.fid(mbf.fid))
+
+		## THIS ASSUMES THE ONLY THING WE COULD WANT AT THIS POINT IS INCLUDES
+		if not (mbi := m_bridge_include.get(m_bridge_include.fid(mbf.fid))):
+			return None
+		if table == "m_bridge_include":
+			return mbi
+
+		if table == "m_include":
+			return m_include.get(m_include.iid(mbi.iid))
+		if table == "m_include_content":
+			mic = m_include_content.get(m_include_content.iid(mbi.iid))
+			if mic is None:
+				return None
+			if only_first:
+				return mic[0]
+			return mic
+
+		# i don't know what you want!
+		print(f"get_on_fname is not built for this! Returning None! Fname: {fname} Table: {table}")
+		return None
+
+
+
+	def handling_tags(self):
+
+		while len(gp.main_dict) != 0:
+			print("goat dead")
+
+
+
+
+
+		return
+
 
 	def insert_all(self):
 		for table in self.loggin:
 			table.insert_set()
 			table.insert_update()
 		return
+
+	def drop_all(self):
+		sql_drop = "DROP TABLE "
+		db = set_db()
+		execdb(db, "SET FOREIGN_KEY_CHECKS = 0;")
+		for table in self.loggin:
+				sql_drop += f"`{table.table_name}`, "
+		print(sql_drop[:-2])
+		for x in range(3):
+			try:
+				execdb(db, sql_drop[:-2])
+			except Exception as e:
+				print("drop failed")
+		unset_db(db)
+		return
+
 
 	def clear_fetch_all(self):
 		for table in self.loggin:
@@ -352,13 +458,13 @@ class Delayed_Executor:
 
 class Table:
 	#example: table("time", (("tid", "INT", "NOT NULL", "AUTO_INCREMENT"),("vid_s", "INT", "NOT NULL"),("vid_e", "INT", "NOT NULL")), ("tid",), (("vid_s", "v_main", "vid"),("vid_e", "v_main", "vid")), (0, 0, 0) )
-	def __init__(self, table_name: str, columns: tuple, primary: tuple, foreign=None, initial_insert=None, no_dupplicate=False, get_list=False):
+	def __init__(self, table_name: str, columns: tuple, primary: tuple, foreign=None, initial_insert=None, no_duplicate=False, get_list=False):
 		self.table_name = table_name
 		self.init_columns = columns
 		self.init_primary = primary
 		self.init_foreign = foreign
 		self.initial_insert = initial_insert
-		self.no_dupplicate = no_dupplicate
+		self.no_duplicate = no_duplicate
 		self.auto_increment = False
 		self.get_list = get_list
 		gp.loggin.append(self)
@@ -447,7 +553,7 @@ class Table:
 			self.current_table[itemgetter(*self.primary_key)(row)] = self.namedtuple(*row)
 
 		if self.auto_increment:
-			self.no_dupplicate_dict = {}
+			self.no_duplicate_dict = {}
 			if self.current_table:
 				self.set_index = max(self.current_table) + 1
 			else:
@@ -522,15 +628,15 @@ class Table:
 		# IF YOU HAVE AN ERROR LIKE(TypeError: m_file_name.__new__() takes 3 positional arguments but 4 were given) THAT MEANS THAT YOU SHOULD USE GET_SET
 		item = self.namedtuple(*item)
 		if (self.auto_increment) and (item[0] is None):
-			if self.no_dupplicate:
-				if (no_dup_key := self.no_dupplicate_dict.get(item[1:])) is not None:
+			if self.no_duplicate:
+				if (no_dup_key := self.no_duplicate_dict.get(item[1:])) is not None:
 					return self.set_table[no_dup_key]
 
 				while self.set_index in self.set_table:
 					self.set_index += 1
 
 				item = (self.set_index,) + item[1:]
-				self.no_dupplicate_dict[item[1:]] = self.set_index
+				self.no_duplicate_dict[item[1:]] = self.set_index
 				self.set_index += 1
 
 			else:
@@ -647,7 +753,6 @@ m_time = Table("m_time",
 	(("tid", "INT", "NOT NULL", "AUTO_INCREMENT"),("vid_s", "INT", "NOT NULL"),("vid_e", "INT", "NOT NULL")),
 	# Primary key(s)
 	("tid",),
-	# Foreign key(s)
 	(("vid_s", "m_v_main", "vid"),("vid_e", "m_v_main", "vid")),
 	# Initial insert(s)
 	((0,0,0),),
@@ -664,15 +769,24 @@ m_moved_file = Table("m_moved_file", (("s_fid", "INT", "NOT NULL"),("e_fid", "IN
 
 m_include = Table("m_include", (("iid", "INT", "NOT NULL", "AUTO_INCREMENT"),("tid", "INT", "NOT NULL")), ("iid",), (("tid", "m_time", "tid"),), ((0,0),), False )
 
-m_include_content = Table("m_include_content", (("iid", "INT", "NOT NULL"),("rank", "INT", "NOT NULL"),("fnid", "INT", "NOT NULL")), ("iid","rank"), (("iid", "m_include", "iid"),("fnid","m_file_name","fnid")), None )
+m_include_content = Table("m_include_content", (("iid", "INT", "NOT NULL"),("rank", "INT", "NOT NULL"),("fnid", "INT", "NOT NULL")), ("iid","rank"), (("iid", "m_include", "iid"),("fnid","m_file_name","fnid")), None , False, True)
 
 m_bridge_include = Table("m_bridge_include", (("fid", "INT", "NOT NULL"),("iid", "INT", "NOT NULL")), ("fid","iid"), (("fid","m_file","fid"),("iid", "m_include", "iid")), None)
 
 m_tag_name = Table("m_tag_name", (("tnid", "INT", "NOT NULL", "AUTO_INCREMENT"),("tname", "VARCHAR(255)", "NOT NULL", "COLLATE utf8mb4_bin")), ("tnid",), None, ((0,""),), True)
 
-m_tag = Table("m_tag", (("tgid", "INT", "NOT NULL", "AUTO_INCREMENT"),("tid", "INT", "NOT NULL"),("ttype", "TINYINT", "UNSIGNED", "NOT NULL"),("tnid", "INT", "NOT NULL")), ("tgid",), (("tid","m_time","tid"),("tnid","m_tag_name","tnid")), ((0,0,0,0),))
+m_type = Table("m_type", (("typeid", "INT", "NOT NULL", "AUTO_INCREMENT"),("tnid", "INT", "NOT NULL"),("tinfo", "TINYINT", "UNSIGNED", "NOT NULL")), ("typeid",), (("tnid","m_tag_name","tnid"),), ((0,0,0),))
 
-m_tag_content = Table("m_tag_content", (("tgid", "INT", "NOT NULL"),("rank", "INT", "NOT NULL"),("mtgid", "INT", "NOT NULL")), ("tgid","rank"), (("tgid","m_tag","tgid"),("mtgid","m_tag","tgid")), None, False, True)
+# Think about unions and kconfig
+# encode typedefs HERE
+m_type_struct = Table("m_type_struct", (("typeid", "INT", "NOT NULL"),("rank", "INT", "NOT NULL"),("tnid", "INT", "NOT NULL"),("innertypeid", "INT", "NOT NULL"),("tspec", "INT", "NOT NULL")), ("typeid","rank"), (("tnid","m_tag_name","tnid"),("typeid","m_type","typeid"),("innertypeid","m_type","typeid")), None, False, True)
+
+# TypeKind use values from TypeKind in cindex to store along with the name so that you can know wtf it is
+m_type_type = Table("m_type_type", (("typeid", "INT", "NOT NULL"),("tnid", "INT", "NOT NULL"),("typekind", "INT", "NOT NULL")), ("typeid",), (("typeid","m_type","typeid"),("tnid","m_tag_name","tnid")))
+
+m_tag = Table("m_tag", (("tgid", "INT", "NOT NULL", "AUTO_INCREMENT"),("tid", "INT", "NOT NULL"),("ttype", "TINYINT", "UNSIGNED", "NOT NULL"),("tnid", "INT", "NOT NULL"),("tspec", "INT", "NOT NULL"),("typeid", "INT")), ("tgid",), (("tid","m_time","tid"),("tnid","m_tag_name","tnid"),("typeid","m_type","typeid")), ((0,0,0,0,0,0),))
+
+#m_tag_content = Table("m_tag_content", (("tgid", "INT", "NOT NULL"),("rank", "INT", "NOT NULL"),("mtgid", "INT", "NOT NULL")), ("tgid","rank"), (("tgid","m_tag","tgid"),("mtgid","m_tag","tgid")), None, False, True)
 
 m_line = Table("m_line", (("lnid", "INT", "NOT NULL", "AUTO_INCREMENT"),("ln_s", "INT", "UNSIGNED", "NOT NULL"),("ln_e", "INT", "UNSIGNED", "NOT NULL")), ("lnid",), None, ((0,4294967295,0),), True)
 
@@ -759,11 +873,17 @@ def initialize_db():
 	print("Creating m_tag_name")
 	m_tag_name.create_table()
 
+	print("Creating m_type")
+	m_type.create_table()
+
+	print("Creating m_type_struct")
+	m_type_struct.create_table()
+
+	print("Creating m_type_type")
+	m_type_type.create_table()
+
 	print("Creating m_tag")
 	m_tag.create_table()
-
-	print("Creating m_tag_content")
-	m_tag_content.create_table()
 
 	print("Creating m_line")
 	m_line.create_table()
@@ -815,6 +935,8 @@ def initialize_db():
 
 	print("Creating m_bridge_kconfig")
 	m_bridge_kconfig.create_table()
+
+
 	return
 
 
@@ -822,11 +944,9 @@ class Master_File:
 	def __init__(self):
 		self.version_dict = {}
 		self.file_dict = {}
-		self.parse_tag = re.compile(r'CONFIG_|operator ')
-		self.parse_tag_typename = re.compile(r'typename:')
-		self.parse_tag_struct = re.compile(r'struct:')
-		self.parse_tag_anon = re.compile(r'__anon')
-
+		# THIS IS BRAINDEAD RETARD SHIT, REMOVE IF NOT USED IN 3 STREAMS (12/24/2025)
+		self.to_be_cleared_dict = {}
+		self.to_be_cleared = {}
 
 	def add_version(self, version_name=None):
 		if version_name is None:
@@ -846,7 +966,34 @@ class Master_File:
 	def clear_all_version(self):
 		for item in self.version_dict:
 			shutil.rmtree(self.version_dict[item])
+
+		# THIS IS BRAINDEAD RETARD SHIT, REMOVE IF NOT USED IN 3 STREAMS (12/24/2025)
+		for item in self.to_be_cleared_dict:
+			shutil.rmtree(self.to_be_cleared_dict[item])
 		return
+
+	# THIS IS BRAINDEAD RETARD SHIT, REMOVE IF NOT USED IN 3 STREAMS (12/24/2025)
+	def git_compile_make(self, version):
+		if self.to_be_cleared.get(version):
+			return self.to_be_cleared[version]
+		self.to_be_cleared_dict[version] = git_clone(version)
+		command = [
+			"make",
+			"-C",
+			f"{self.to_be_cleared_dict[version]}",
+			"allyesconfig"
+		]
+		sp.run(command)
+		self.to_be_cleared_dict[version] = git_clone(version)
+		command = [
+			"make",
+			"-C",
+			f"{self.to_be_cleared_dict[version]}",
+			"prepare"
+		]
+		sp.run(command)
+		self.to_be_cleared[version] = f"{self.to_be_cleared_dict[version]}/include/generated/autoconf.h"
+		return f"{self.to_be_cleared_dict[version]}/include/generated/autoconf.h"
 
 	def get_file(self, file_path, version=None):
 		if version is None:
@@ -911,77 +1058,151 @@ class Master_File:
 				return final_arr
 		return False
 
-	def get_tags(self, file_path, version=None):
-		temp_type = type_check(file_path)
-		if not (temp_type == 2 or temp_type == 3):
-			return False
 
+	#def ast_type_sniffer(self, cursor):
+#type.get_canonical()
+
+	def ast_struct_sniffer(self, cursor):
+		saved_extent = None
+		sub_processing_list = []
+		for kids in cursor.get_children():
+			print(f"-----{kids.spelling}-----{kids.kind}")
+			kind = f"{kids.kind}"
+
+			if kind == "CursorKind.STRUCT_DECL":
+				sub_processing_list.append(["CursorKind.STRUCT_DECL", f"{kids.spelling}", kids.extent.start.line, kids.extent.start.column, kids.extent.end.line, kids.extent.end.column])
+				saved_extent = kids.spelling
+				print("-")
+
+
+				###### SHIT
+				if kids.type.get_pointee():
+					print(f"{kids.type.get_pointee().get_declaration().get_definition()}")
+				else:
+					print("we None in kids.type.get_declaration()")
+				######/ SHIT
+
+			elif kind == "CursorKind.FIELD_DECL":
+				if f"{saved_extent}" == f"{kids.type.get_pointee().get_declaration().spelling}":
+					sub_processing_list[-1].append(["CursorKind.FIELD_DECL", f"{kids.spelling}"])
+					print("hi, i should be in the prior struct")
+				else:
+					saved_extent = None
+					sub_processing_list.append(["CursorKind.FIELD_DECL", f"{kids.spelling}", kids.extent.start.line, kids.extent.start.column, kids.extent.end.line, kids.extent.end.column])
+				print(f"typedef-type")
+
+			else:
+				print("War crime")
+
+		return sub_processing_list
+
+
+	# include/linux/lockd/bind.h
+	def ast_type(self, file_path, version=None):
 		if version is None:
 			version=gp.version_name
 
-		command = [
-			"ctags",
-			"--sort=no",
-			"--output-format=xref",
-			"--fields=+neK",
-			'--_xformat=%N %n %{end} %K %{typeref}',
-			"--kinds-c=+p+x",
-			"--extras=-{anonymous}",
-			"-o", "-",
-			f"{mf.version_dict[version]}/{file_path}"
-		]
+		# Initialize the Clang index
+		index = clang.cindex.Index.create()
 
-		tagss = sp.run(command, capture_output=True, text=True)
-		tags = tagss.stdout.splitlines()
-		#if file_path == "tools/usb/ffs-test.c":
-		#	with open(f"{mf.version_dict[version]}/{file_path}", "r") as file:
-		#		content = file.read()
-		#		print(content)
-		#	print("THIS IS HELL1")
-		#	print(tags)
-		#	print("THIS IS HELL")
-		#	print(tagss.stderr)
-		# BASED DEPARTMENT @436f6c74
+		translation_unit = index.parse(f"{mf.version_dict[version]}/{file_path}", args=[
+			"-D__KERNEL__",#"-nostdinc",
+			f"-I{mf.version_dict[version]}/{"/".join(file_path.split("/")[:-1])}",
+			f"-I{mf.version_dict[version]}/include",
+			f"-I{mf.version_dict[version]}/include/uapi"
+		],
+		options=clang.cindex.TranslationUnit.PARSE_DETAILED_PROCESSING_RECORD)
 
-		result_tags = []
+		###########################################################################
+		clang.cindex.conf.lib.clang_getSkippedRanges.restype = CXSourceRangeList_P#
+		###########################################################################
+		Skipped_ranges = clang.cindex.conf.lib.clang_getSkippedRanges(
+			translation_unit,
+			translation_unit.get_file(f"{mf.version_dict[version]}/{file_path}")
+		)
 
-		for i, tag in enumerate(tags):
-			if re.match(self.parse_tag, tag):
-				continue
-			result_tags.append(tag.split(" ", 4))
-			try:
-				result_tags[-1][3] = ctags_type(result_tags[-1][3])
-				result_tags[-1][1] = int(result_tags[-1][1])
-				if result_tags[-1][2] == '':
-					result_tags[-1][2] = result_tags[-1][1]
-				else:
-					result_tags[-1][2] = int(result_tags[-1][2])
+		current_file = self.get_file(file_path, version).splitlines()
+
+		for line in current_file:
+			print("lolberg")
 
 
-				# When we have a struct:"7" we should:
-				# 1. detect the following members
-				# 2. correct the fact that they would be a type member and (Maybe) set them to the actual type (Unsure think about it more but we should probably have an idea of what the fuck it is)
-				# 3. Record in a seperate table that links between the "Main" struct and the "Member" tag.
-				# GOOD LUCK
+		print("----")
+		for i in range(Skipped_ranges.contents.count):
+			print(Skipped_ranges.contents.ranges[i])
+			if current_file[Skipped_ranges.contents.ranges[i].start.line-1].startswith("#ifdef"):
+				for FUCJK in current_file[Skipped_ranges.contents.ranges[i].start.line-1].split(" ")[1:]:
+					print(FUCJK)
+			for x in current_file[Skipped_ranges.contents.ranges[i].start.line-1:Skipped_ranges.contents.ranges[i].end.line]:
+				print(x)
 
-				# parsing of the type of a member ############################################## UNFINISHED ¯\_(ツ)_/¯
-				#if result_tags[-1][3] == 6:
-				#	if re.match(result_tags[-1][4], self.parse_tag_typename):
-				#		result_tags[-1][4] = result_tags[-1][9:]
-				#	elif re.match(result_tags[-1][4], self.parse_tag_struct):
-				#		result_tags[-1][4] = result_tags[-1][7:]
-				#		if re.match(result_tags[-1][4], self.parse_tag_anon):
-				#			result_tags[-1][4] = None
-			except IndexError:
-				print("mf.get_tags get demolished by this tag:")
-				print(result_tags[-1])
-				del result_tags[-1]
-				continue
-		if not result_tags:
-			return None
+		emergency_shutdown()
+		for include in translation_unit.get_includes():
+			print(include.source)
 
-		return result_tags
 
+		# PROCESS LOOP
+		processing_list = []
+		for kids in translation_unit.cursor.get_children():
+			if f"{kids.location.file}" == f"{mf.version_dict[version]}/{file_path}":
+				print(f"{kids.spelling}-----{kids.kind}")
+				if f"{kids.kind}" == "CursorKind.STRUCT_DECL":
+					processing_list.append([f"{kids.spelling}", kids.extent.start.line, kids.extent.start.column, kids.extent.end.line, kids.extent.end.column, self.ast_struct_sniffer(kids)])
+
+		print("----------")
+		# PRINT LOOP
+		for x in processing_list:
+			print(x[:5])
+			for y in x[5]:
+				print("   " + str(y))
+
+		print("----------")
+		# DEBUG LOOP
+		if translation_unit.diagnostics:
+			print("Generic Parse Errors:")
+			for diag in translation_unit.diagnostics:
+				print(f"  - {diag.spelling} (Line:{diag.location.line} File:{diag.location.file})")
+		return
+
+
+	def ast_nightmare(self, file_path, version=None):
+		if version is None:
+			version=gp.version_name
+		# Initialize the Clang index
+		index = clang.cindex.Index.create()
+
+		# Parse the source file
+		translation_unit = index.parse(f"{mf.version_dict[version]}/{file_path}")
+		for kids in translation_unit.cursor.get_children():
+			processing_list = []
+			if f"{kids.location.file}" == f"{mf.version_dict[version]}/{file_path}":
+				if f"{kids.kind}" == "CursorKind.FUNCTION_DECL":
+					processing_list.append(1)
+					processing_list.append(kids.spelling)
+					processing_list.append(kids.extent.start.line)
+					processing_list.append(kids.extent.start.column)
+					processing_list.append(kids.extent.end.line)
+					processing_list.append(kids.extent.end.column)
+
+					for todlers in kids.get_arguments():
+						if f"{todlers.location.file}" == f"{mf.version_dict[version]}/{file_path}":
+							processing_list.append([2])
+							processing_list[-1].append(todlers.spelling)
+							bitmap = 0
+							bitmap_p = 0
+
+							if todlers.is_const_method():
+								bitmap += 1 << 0
+							if todlers.is_static_method():
+								bitmap += 1 << 1
+							if f"{todlers.type.kind}" == "TypeKind.POINTER":
+								bitmap_p += 1 << 0
+								if todlers.type.get_pointee().is_const_qualified():
+									bitmap_p += 1 << 1
+							processing_list[-1].append(bitmap)
+							processing_list[-1].append(bitmap_p)
+							processing_list[-1].append(todlers.type.kind)
+					print(processing_list)
 
 
 mf = Master_File()
@@ -1015,6 +1236,20 @@ def git_clone(version):
 
 	sp.run(command)
 	shutil.rmtree(f"{temp_path}/.git")
+	command = [
+		"ln",
+		"-s",
+		"asm-generic",
+		f"{temp_path}/include/asm"
+	]
+	sp.run(command)
+	command = [
+		"ln",
+		"-s",
+		"asm-generic",
+		f"{temp_path}/include/uapi/asm"
+	]
+	sp.run(command)
 	return temp_path
 
 def git_file_list(version):
@@ -1028,6 +1263,8 @@ def git_file_list(version):
 	]
 	raw_file = sp.run(command, capture_output=True, text=True)
 	return raw_file.stdout
+
+
 
 ########### GIT UTILS ###########
 
@@ -1053,42 +1290,6 @@ def type_check(name):
 	else:
 		return 0
 
-def ctags_type(type):
-	match type:
-		case "macro":
-			return 1
-		case "enumerator":
-			return 2
-		case "function":
-			return 3
-		case "enum":
-			return 4
-		case "header":
-			return 5
-		case "member":
-			return 6
-		case "struct":
-			return 7
-		case "typedef":
-			return 8
-		case "union":
-			return 9
-		case "variable":
-			return 10
-		case "prototype":
-			return 11
-		case "externvar":
-			return 12
-		case "class":
-			return 13
-		case "slot":
-			return 14
-		case "signal":
-			return 15
-		print("did not find ctag kind: " + type)
-	return 0
-
-
 
 def file_processing(start, end=None, override_list=None):
 	global multi_proc
@@ -1103,11 +1304,12 @@ def file_processing(start, end=None, override_list=None):
 		#print(changed_files, flush=True)
 	for changed_file in changed_files:
 		cut_file = tuple(changed_file.split("\t"))
-		cs = []
+		CS = None
 		try:
 			match cut_file[0][0]:
 				case "D":
 					# DELETE
+					CS = Change_Set(cut_file[1])
 					# Get old_bf
 					old_bf = m_bridge_file.get(
 						m_bridge_file.vid(gp.old_vid),
@@ -1119,13 +1321,13 @@ def file_processing(start, end=None, override_list=None):
 						print(m_file_name.get(m_file_name.fname(cut_file[1])))
 						continue
 					# 0 New TID for FILE
-					cs.append(m_time(
+					CS(m_time(
 						None,
 						m_time.get( m_time.tid( m_file.get( m_file.fid(old_bf.fid) ).tid ) ).vid_s,
 						gp.old_vid
 					))
 					# 1 Update FILE
-					cs.append(m_file.update(
+					CS(m_file.update(
 						old_bf.fid,
 						X[0].tid,
 						None,
@@ -1136,48 +1338,18 @@ def file_processing(start, end=None, override_list=None):
 					# Check if iid existed
 					if (temp_iid := m_bridge_include.get(m_bridge_include.fid(old_bf.fid))):
 						# 2 New TID for INCLUDE
-						cs.append(m_time(
+						CS(m_time(
 							None,
 							m_time.get( m_time.tid( m_include.get( m_include.iid(temp_iid.iid) ).tid ) ).vid_s,
 							gp.old_vid
 						))
 						# 3 Update INCLUDE
-						cs.append(m_include.update(temp_iid.iid, X[2].tid))
+						CS(m_include.update(temp_iid.iid, X[2].tid))
 					#EXIT INCLUDES
 
-					if (old_tags := m_bridge_tag.get(m_bridge_tag.fid(old_bf.fid))):
-						for old_tag in old_tags:
-							if old_tag is None:
-								continue
-							# ? New TID for TAG
-							cs.append(m_time(
-								None,
-								m_time.get( m_time.tid( m_tag.get( m_tag.tgid(old_tag.tgid) ).tid ) ).vid_s,
-								gp.old_vid
-							))
-							# ? Update TAG
-							cs.append(m_tag.update(old_tag.tgid, X[-1].tid, None, None))
-
-					# temp = get_file(db, vid - 1, cut_file[1])
-					# if temp is not None:
-					# 	execdb(db, f"UPDATE file SET tid = {tid_dict.get(temp[1])}, ftype = {temp[2]}, s_stat = '{temp[3]}', e_stat = 'D' WHERE fid = {temp[0]};")
-					# 	if temp[2] == 2 or temp[2] == 3:
-					# 		if ENABLE_INCLUDE:
-					# 			selectdb(db, f"SELECT bi.iid, i.tid FROM include AS i INNER JOIN bridge_include AS bi ON bi.iid = i.iid WHERE fid = {temp[0]} LIMIT 1")
-					# 			iid_tid = db[1].fetchone()
-					# 			if iid_tid is not None:
-					# 				execdb(db, f"UPDATE include SET tid = {tid_dict.get(iid_tid[1])} WHERE iid = {iid_tid[0]};")
-					# 		if ENABLE_CTAGS:
-					# 			selectdb(db, f"SELECT bt.tgid, t.tid FROM tag AS t INNER JOIN bridge_tag AS bt ON bt.tgid = t.tgid WHERE fid = {temp[0]}")
-					# 			tgid_tids = db[1].fetchall()
-					# 			insert_tag = ""
-					# 			insert_tag_where = ""
-					# 			for tgid_tid in tgid_tids:
-					# 				insert_tag += f"WHEN {tgid_tid[0]} THEN {tid_dict.get(tgid_tid[1])} "
-					# 				insert_tag_where += f"{tgid_tid[0]}, "
-					# 			if insert_tag != "":
-					# 				execdb(db, f"UPDATE tag SET tid = CASE tgid {insert_tag}END WHERE tgid IN ({insert_tag_where[:-2]});")
 				case "R":
+					CS = Change_Set(cut_file[2])
+
 					if cut_file[0][1:4] == "100":
 						# Exact Moved
 						# Get old_bf
@@ -1191,13 +1363,13 @@ def file_processing(start, end=None, override_list=None):
 							print(m_file_name.get(m_file_name.fname(cut_file[1])))
 							raise _MyBreak
 						# 0 New TID for old FILE
-						cs.append(m_time(
+						CS(m_time(
 							None,
 							m_time.get( m_time.tid( m_file.get( m_file.fid(old_bf.fid) ).tid ) ).vid_s,
 							gp.old_vid
 						))
 						# 1 Update old FILE
-						cs.append(m_file.update(
+						CS(m_file.update(
 							old_bf.fid,
 							X[0].tid,
 							None,
@@ -1206,50 +1378,21 @@ def file_processing(start, end=None, override_list=None):
 						))
 
 						# 2 Check if FNAME exist/Create FNAME
-						cs.append(m_file_name.get_set(m_file_name.fname(cut_file[2])))
+						CS(m_file_name.get_set(m_file_name.fname(cut_file[2])))
 						# 3 Create FILE
-						cs.append(m_file(None, gp.tid, type_check(cut_file[2]), "R", 0))
+						CS(m_file(None, gp.tid, type_check(cut_file[2]), "R", 0))
 						# 4 Create BRIDGE FILE
-						cs.append(m_bridge_file(gp.vid, X[2].fnid, X[3].fid))
+						CS(m_bridge_file(gp.vid, X[2].fnid, X[3].fid))
 
 						# 5 Create MOVED FILE
-						cs.append(m_moved_file(old_bf.fid, X[3].fid))
+						CS(m_moved_file(old_bf.fid, X[3].fid))
 
 						# Check if iid existed
 						if (temp_iid := m_bridge_include.get(m_bridge_include.fid(old_bf.fid))):
 							# 6 Create BRIDGE INCLUDE
-							cs.append(m_bridge_include(X[3].fid, temp_iid.iid))
+							CS(m_bridge_include(X[3].fid, temp_iid.iid))
 						#EXIT INCLUDES
 
-
-
-					# 	# Correct old file
-					# 	temp = get_file(db, vid - 1, cut_file[1])
-					# 	if temp is not None:
-					# 		execdb(db, f"UPDATE file SET tid = {tid_dict.get(temp[1])}, ftype = {temp[2]}, s_stat = '{temp[3]}', e_stat = 'R' WHERE fid = {temp[0]};")
-		#
-					# 	# Create new fnid/file/bridge_file/moved_file
-					# 	temp_fnid = fnid_dict.get(cut_file[2])
-					# 	execdb(db, f"INSERT INTO file (tid, ftype, s_stat, e_stat) VALUES ({s_tid}, {type_check(cut_file[2])}, 'R', 0);")
-					# 	new_fid = db[1].lastrowid
-					# 	execdb(db, f"INSERT INTO bridge_file (vid, fnid, fid) VALUES ({vid}, {temp_fnid}, {new_fid});")
-					# 	if temp is not None:
-					# 		execdb(db, f"INSERT INTO moved_file (s_fid, e_fid) VALUES ({temp[0]}, {new_fid});")
-					# 		if temp[2] == 2 or temp[2] == 3:
-					# 			if ENABLE_INCLUDE:
-					# 				selectdb(db, f"SELECT iid FROM bridge_include WHERE fid = {temp[0]} LIMIT 1")
-					# 				iid = db[1].fetchone()
-					# 				if iid is not None:
-					# 					execdb(db, f"INSERT INTO bridge_include (fid, iid) VALUES ({new_fid}, {iid[0]});")
-					# 			if ENABLE_CTAGS:
-					# 				selectdb(db, f"SELECT tgid, lnid FROM bridge_tag WHERE fid = {temp[0]}")
-					# 				tags = db[1].fetchall()
-					# 				for tag in tags:
-					# 					execdb(db, f"INSERT INTO bridge_tag (fid, tgid, lnid) VALUES ({new_fid}, {tag[0]}, {tag[1]});")
-					# 	else:
-					# 		if ENABLE_CTAGS or ENABLE_INCLUDE:
-					# 			if type_c_h(cut_file[2]):
-					# 				parse_include_tag(db, new_fid, new_fid, cut_file[2])
 					else:
 						# RENAME MODIFY
 						# Get old_bf
@@ -1263,13 +1406,13 @@ def file_processing(start, end=None, override_list=None):
 							print(m_file_name.get(m_file_name.fname(cut_file[1])))
 							raise _MyBreak
 						# 0 New TID for old FILE
-						cs.append(m_time(
+						CS(m_time(
 							None,
 							m_time.get( m_time.tid( m_file.get( m_file.fid(old_bf.fid) ).tid ) ).vid_s,
 							gp.old_vid
 						))
 						# 1 Update old FILE
-						cs.append(m_file.update(
+						CS(m_file.update(
 							old_bf.fid,
 							X[0].tid,
 							None,
@@ -1278,14 +1421,14 @@ def file_processing(start, end=None, override_list=None):
 						))
 
 						# 2 Check if FNAME exist/Create FNAME
-						cs.append(m_file_name.get_set(m_file_name.fname(cut_file[2])))
+						CS(m_file_name.get_set(m_file_name.fname(cut_file[2])))
 						# 3 Create FILE
-						cs.append(m_file(None, gp.tid, type_check(cut_file[2]), "R", 0))
+						CS(m_file(None, gp.tid, type_check(cut_file[2]), "R", 0))
 						# 4 Create BRIDGE FILE
-						cs.append(m_bridge_file(gp.vid, X[2].fnid, X[3].fid))
+						CS(m_bridge_file(gp.vid, X[2].fnid, X[3].fid))
 
 						# 5 Create MOVED FILE
-						cs.append(m_moved_file(old_bf.fid, X[3].fid))
+						CS(m_moved_file(old_bf.fid, X[3].fid))
 
 						# INCLUDE HANDLING
 						need_to_add_includes = False
@@ -1297,7 +1440,7 @@ def file_processing(start, end=None, override_list=None):
 								# Check if they are the same
 								if mf.get_includes(cut_file[1], gp.old_version_name) == includes:
 									# 6 Create BRIDGE include
-									cs.append(m_bridge_include(X[2].fid, old_bi.iid))
+									CS(m_bridge_include(X[2].fid, old_bi.iid))
 								else:
 									need_to_add_includes = True
 									need_to_del_old_includes = True
@@ -1310,49 +1453,32 @@ def file_processing(start, end=None, override_list=None):
 
 						if need_to_del_old_includes:
 							# 6 New TID for old INCLUDE
-							cs.append(m_time(
+							CS(m_time(
 								None,
 								m_time.get( m_time.tid( m_include.get( m_include.iid(old_bi.iid) ).tid ) ).vid_s,
 								gp.old_vid
 							))
 							# 7 Update old INCLUDE
-							cs.append(m_include.update(old_bi.iid, X[6].tid))
+							CS(m_include.update(old_bi.iid, X[6].tid))
 
 						if need_to_add_includes:
 							# Get position of INCLUDE in cs
-							pos_include = len(cs)
+							pos_include = len(CS.cs)
 							# Create INCLUDE
-							cs.append(m_include(None, gp.tid))
+							CS(m_include(None, gp.tid))
 							# ? Create BRIDGE INCLUDE
-							cs.append(m_bridge_include(X[2].fid, X[pos_include].iid))
+							CS(m_bridge_include(X[2].fid, X[pos_include].iid))
 							# ?? Generate include content with file names
 							count_rank = 0
 							for include in includes:
-								cs.append(m_file_name.get_set(m_file_name.fname(include)))
-								cs.append(m_include_content(X[pos_include].iid, count_rank, X[-1].fnid))
+								CS(m_file_name.get_set(m_file_name.fname(include)))
+								CS(m_include_content(X[pos_include].iid, count_rank, X[-1].fnid))
 								count_rank += 1
 							#EXIT INCLUDES
 
-						# # Correct old file
-						# temp = get_file(db, vid - 1, cut_file[1])
-						# if temp is not None:
-						# 	execdb(db, f"UPDATE file SET tid = {tid_dict.get(temp[1])}, ftype = {temp[2]}, s_stat = '{temp[3]}', e_stat = 'R' WHERE fid = {temp[0]};")
-		#
-						# # Create new fnid/file/bridge_file/moved_file
-						# temp_fnid = fnid_dict.get(cut_file[2])
-						# execdb(db, f"INSERT INTO file (tid, ftype, s_stat, e_stat) VALUES ({s_tid}, {type_check(cut_file[2])}, 'R', 0);")
-						# new_fid = db[1].lastrowid
-						# execdb(db, f"INSERT INTO bridge_file (vid, fnid, fid) VALUES ({vid}, {temp_fnid}, {new_fid});")
-						# if temp is not None:
-						# 	execdb(db, f"INSERT INTO moved_file (s_fid, e_fid) VALUES ({temp[0]}, {new_fid});")
-						# if ENABLE_CTAGS or ENABLE_INCLUDE:
-						# 	if type_c_h(cut_file[2]):
-						# 		if temp is not None:
-						# 			parse_include_tag(db, new_fid, temp[0], cut_file[2], cut_file[1])
-						# 		else:
-						# 			parse_include_tag(db, new_fid, new_fid, cut_file[2])
 				case "M":
 					# MODIFY
+					CS = Change_Set(cut_file[1])
 					# Get old_bf
 					old_bf = m_bridge_file.get(
 						m_bridge_file.vid(gp.old_vid),
@@ -1365,13 +1491,13 @@ def file_processing(start, end=None, override_list=None):
 						#print(m_bridge_file.current_table)
 						raise _MyBreak
 					# 0 New TID for old FILE
-					cs.append(m_time(
+					CS(m_time(
 						None,
 						m_time.get( m_time.tid( m_file.get( m_file.fid(old_bf.fid) ).tid ) ).vid_s,
 						gp.old_vid
 					))
 					# 1 Update old FILE
-					cs.append(m_file.update(
+					CS(m_file.update(
 						old_bf.fid,
 						X[0].tid,
 						None,
@@ -1380,9 +1506,9 @@ def file_processing(start, end=None, override_list=None):
 					))
 
 					# 2 Create FILE
-					cs.append(m_file(None, gp.tid, type_check(cut_file[1]), "M", 0))
+					CS(m_file(None, gp.tid, type_check(cut_file[1]), "M", 0))
 					# 3 Create BRIDGE FILE
-					cs.append(m_bridge_file(gp.vid, old_bf.fnid, X[2].fid))
+					CS(m_bridge_file(gp.vid, old_bf.fnid, X[2].fid))
 
 					# INCLUDE HANDLING
 					need_to_add_includes = False
@@ -1394,7 +1520,7 @@ def file_processing(start, end=None, override_list=None):
 							# Check if they are the same
 							if mf.get_includes(cut_file[1], gp.old_version_name) == includes:
 								# 4 Create BRIDGE include
-								cs.append(m_bridge_include(X[2].fid, old_bi.iid))
+								CS(m_bridge_include(X[2].fid, old_bi.iid))
 							else:
 								need_to_add_includes = True
 								need_to_del_old_includes = True
@@ -1407,167 +1533,63 @@ def file_processing(start, end=None, override_list=None):
 
 					if need_to_del_old_includes:
 						# 4 New TID for old INCLUDE
-						cs.append(m_time(
+						CS(m_time(
 							None,
 							m_time.get( m_time.tid( m_include.get( m_include.iid(old_bi.iid) ).tid ) ).vid_s,
 							gp.old_vid
 						))
 						# 5 Update old INCLUDE
-						cs.append(m_include.update(old_bi.iid, X[4].tid))
+						CS(m_include.update(old_bi.iid, X[4].tid))
 
 					if need_to_add_includes:
 						# Get position of INCLUDE in cs
-						pos_include = len(cs)
+						pos_include = len(CS.cs)
 						# Create INCLUDE
-						cs.append(m_include(None, gp.tid))
+						CS(m_include(None, gp.tid))
 						# ? Create BRIDGE INCLUDE
-						cs.append(m_bridge_include(X[2].fid, X[pos_include].iid))
+						CS(m_bridge_include(X[2].fid, X[pos_include].iid))
 						# ?? Generate include content with file names
 						count_rank = 0
 						for include in includes:
-							cs.append(m_file_name.get_set(m_file_name.fname(include)))
-							cs.append(m_include_content(X[pos_include].iid, count_rank, X[-1].fnid))
+							CS(m_file_name.get_set(m_file_name.fname(include)))
+							CS(m_include_content(X[pos_include].iid, count_rank, X[-1].fnid))
 							count_rank += 1
 					#EXIT INCLUDES
-					old_tag_list = []
-					if (old_tags := m_bridge_tag.get(m_bridge_tag.fid(old_bf.fid))):
-						for old_tag in old_tags:
-							old_tag_list.append((m_tag.get(m_tag.tgid(old_tag.tgid)), m_line.get(m_line.lnid(old_tag.lnid))))
-					if (new_tags := mf.get_tags(cut_file[1])):
-						for tag in new_tags:
-							if not tag:
-								continue
-							var_moron = True
-							# Is the tag in prior version, Check for name
-							if (new_tag_name := m_tag_name.get(m_tag_name.tname(tag[0]))):
-								# Is the tag in prior version, Check for actual tag
-								for pos, old_tag in enumerate(old_tag_list):
-									try:
-										if old_tag[0].tnid == new_tag_name.tnid:
-											new_file = mf.get_file(cut_file[1]).splitlines()
-											old_file = mf.get_file(cut_file[1], gp.old_version_name).splitlines()
 
-											if new_file[tag[1]:tag[2]] == old_file[old_tag[1].ln_s:old_tag[1].ln_e]:
-												# ​(╯°□°)╯︵ ┻━┻ => (ヘ･_･)ヘ┳━┳
-												# ? Create LINE
-												cs.append(m_line.get_set(m_line.ln_s(tag[1]), m_line.ln_e(tag[2])))
-												# ? Create BRIDGE TAG entry for old tag with new fid
-												cs.append(m_bridge_tag(X[2].fid, old_tag[0].tgid, X[-1].lnid))
-											else:
-												# ? New TID for TAG
-												cs.append(m_time(
-													None,
-													m_time.get( m_time.tid( m_tag.get( m_tag.tgid(old_tag[0].tgid) ).tid ) ).vid_s,
-													gp.old_vid
-												))
-												# ? Update old TAG
-												cs.append(m_tag.update(old_tag[0].tgid, X[-1].tid, None, None))
-												# ? Create TAG
-												cs.append(m_tag(None, gp.tid, tag[3], new_tag_name.tnid))
-												# ? Create LINE
-												cs.append(m_line.get_set(m_line.ln_s(tag[1]), m_line.ln_e(tag[2])))
-												# ? Create BRIDGE TAG
-												cs.append(m_bridge_tag(X[2].fid, X[-2].tgid, X[-1].lnid))
-											var_moron = False
-											del old_tag_list[pos]
-											break
-									except IndexError:
-										continue
-									except TypeError:
-										print("---------------")
-										print(tag)
-										print("---------------")
-
-							if var_moron:
-								# ? Create TAG NAME
-								cs.append(m_tag_name.get_set(m_tag_name.tname(tag[0])))
-								# ? Create TAG
-								cs.append(m_tag(None, gp.tid, tag[3], X[-1].tnid))
-								# ? Create LINE
-								cs.append(m_line.get_set(m_line.ln_s(tag[1]), m_line.ln_e(tag[2])))
-								# ? Create BRIDGE TAG
-								cs.append(m_bridge_tag(X[2].fid, X[-2].tgid, X[-1].lnid))
-					for old_tag in old_tag_list:
-						if not old_tag:
-							continue
-						# ? New TID for TAG
-						cs.append(m_time(
-							None,
-							m_time.get( m_time.tid( m_tag.get( m_tag.tgid(old_tag[0].tgid) ).tid ) ).vid_s,
-							gp.old_vid
-						))
-						# ? Update old TAG
-						cs.append(m_tag.update(old_tag[0].tgid, X[-1].tid, None, None))
-
-
-
-					# # Correct old file
-					# temp = get_file(db, vid - 1, cut_file[1])
-					# if temp is not None:
-					# 	execdb(db, f"UPDATE file SET tid = {tid_dict.get(temp[1])}, ftype = {temp[2]}, s_stat = '{temp[3]}', e_stat = 'M' WHERE fid = {temp[0]};")
-					#
-					# # Create new file/bridge_file
-					# temp_fnid = fnid_dict.get(cut_file[1])
-					# execdb(db, f"INSERT INTO file (tid, ftype, s_stat, e_stat) VALUES ({s_tid}, {type_check(cut_file[1])}, 'M', 0);")
-					# new_fid = db[1].lastrowid
-					# execdb(db, f"INSERT INTO bridge_file (vid, fnid, fid) VALUES ({vid}, {temp_fnid}, {new_fid});")
-					# if ENABLE_CTAGS or ENABLE_INCLUDE:
-					# 	if type_c_h(cut_file[1]):
-					# 		if temp is not None:
-					# 			parse_include_tag(db, new_fid, temp[0], cut_file[1], cut_file[1])
-					# 		else:
-					# 			parse_include_tag(db, new_fid, new_fid, cut_file[1])
 		except _MyBreak:
-			if cs:
-				print(f"This failed bad after a _MyBreak... : {cs}")
+			if CS:
+				print(f"This failed bad after a _MyBreak... : {CS}")
 				continue
 
-		if not cs:
+		if not CS:
 			# Add or other
+			CS = Change_Set(cut_file[1])
 			# 0 Check if FNAME exist/Create FNAME
-			cs.append(m_file_name.get_set(m_file_name.fname(cut_file[1])))
+			CS(m_file_name.get_set(m_file_name.fname(cut_file[1])))
 
 			# 1 Create FILE
-			cs.append(m_file(None, gp.tid, type_check(cut_file[1]), "A", 0))
+			CS(m_file(None, gp.tid, type_check(cut_file[1]), "A", 0))
 			# 2 Create BRIDGE FILE
-			cs.append(m_bridge_file(gp.vid, X[0].fnid, X[1].fid))
-
+			CS(m_bridge_file(gp.vid, X[0].fnid, X[1].fid))
 			# Check for include
 			if (includes := mf.get_includes(cut_file[1])):
+				CS.includes.append(includes)
 				# 3 Create INCLUDE
-				cs.append(m_include(None, gp.tid))
+				CS(m_include(None, gp.tid))
 				# 4 Create BRIDGE INCLUDE
-				cs.append(m_bridge_include(X[1].fid, X[3].iid))
+				CS(m_bridge_include(X[1].fid, X[3].iid))
 				# ?? Generate include content with file names
 				count_rank = 0
 				for include in includes:
-					cs.append(m_file_name.get_set(m_file_name.fname(include)))
-					cs.append(m_include_content(X[3].iid, count_rank, X[-1].fnid))
+					CS(m_file_name.get_set(m_file_name.fname(include)))
+					CS(m_include_content(X[3].iid, count_rank, X[-1].fnid))
 					count_rank += 1
 
-			if (new_tags := mf.get_tags(cut_file[1])):
-				for tag in new_tags:
-					if not tag:
-						continue
-					# ? Create TAG NAME
-					cs.append(m_tag_name.get_set(m_tag_name.tname(tag[0])))
-					# ? Create TAG
-					cs.append(m_tag(None, gp.tid, tag[3], X[-1].tnid))
-					# ? Create LINE
-					cs.append(m_line.get_set(m_line.ln_s(tag[1]), m_line.ln_e(tag[2])))
-					# ? Create BRIDGE TAG
-					cs.append(m_bridge_tag(X[1].fid, X[-2].tgid, X[-1].lnid))
-
-
 			#EXIT INCLUDES
+
 		# Store Set
-		gp.set(*cs)
+		gp.main_dict[CS.file_name] = CS
 
-
-
-				# if ENABLE_CTAGS or ENABLE_INCLUDE:
-				# 	if type_c_h(cut_file[1]):
-				# 		parse_include_tag(db, new_fid, new_fid, cut_file[1])
 	if override_list:
 		multi_proc = False
 	else:
@@ -1581,6 +1603,12 @@ def update(version):
 	# Pre-Processing
 	gp.create_new_vid(version)
 	mf.add_version()
+	#include/linux/netfilter_bridge/ebtables.h
+	mf.ast_type("security/capability.c")
+	#mf.ast_nightmare("tools/usb/ffs-test.c")
+	emergency_shutdown()
+
+
 	gp.create_new_tid(gp.vid)
 
 	gp.generate_change_list()
@@ -1617,6 +1645,7 @@ def update(version):
 
 
 def main():
+	gp.drop_all()
 	initialize_db()
 	update("v3.0")
 	update("v3.1")
