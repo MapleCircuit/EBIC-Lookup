@@ -35,6 +35,20 @@ class CXSourceRangeList(ctypes.Structure):
 CXSourceRangeList_P = ctypes.POINTER(CXSourceRangeList)
 
 
+########https://gist.github.com/ChunMinChang/88bfa5842396c1fbbc5b
+def commentRemover(text):
+	def replacer(match):
+		s = match.group(0)
+		if s.startswith('/'):
+			return "\n" * s.count( "\n" )
+		else:
+			return s
+	pattern = re.compile(
+		r'//.*?$|/\*.*?\*/|\'(?:\\.|[^\\\'])*\'|"(?:\\.|[^\\"])*"',
+		re.DOTALL | re.MULTILINE
+	)
+	return re.sub(pattern, replacer, text)
+#######
 
 ########### DB UTILS ###########
 def connect_sql():
@@ -775,16 +789,16 @@ m_bridge_include = Table("m_bridge_include", (("fid", "INT", "NOT NULL"),("iid",
 
 m_tag_name = Table("m_tag_name", (("tnid", "INT", "NOT NULL", "AUTO_INCREMENT"),("tname", "VARCHAR(255)", "NOT NULL", "COLLATE utf8mb4_bin")), ("tnid",), None, ((0,""),), True)
 
-m_type = Table("m_type", (("typeid", "INT", "NOT NULL", "AUTO_INCREMENT"),("tnid", "INT", "NOT NULL"),("tinfo", "TINYINT", "UNSIGNED", "NOT NULL")), ("typeid",), (("tnid","m_tag_name","tnid"),), ((0,0,0),))
+m_ast = Table("m_ast", (("aid", "INT", "NOT NULL", "AUTO_INCREMENT"),("tnid", "INT", "NOT NULL"),("tinfo", "TINYINT", "UNSIGNED", "NOT NULL")), ("aid",), (("tnid","m_tag_name","tnid"),), ((0,0,0),))
 
 # Think about unions and kconfig
 # encode typedefs HERE
-m_type_struct = Table("m_type_struct", (("typeid", "INT", "NOT NULL"),("rank", "INT", "NOT NULL"),("tnid", "INT", "NOT NULL"),("innertypeid", "INT", "NOT NULL"),("tspec", "INT", "NOT NULL")), ("typeid","rank"), (("tnid","m_tag_name","tnid"),("typeid","m_type","typeid"),("innertypeid","m_type","typeid")), None, False, True)
+m_ast_struct = Table("m_ast_struct", (("aid", "INT", "NOT NULL"),("rank", "INT", "NOT NULL"),("tnid", "INT", "NOT NULL"),("inneraid", "INT", "NOT NULL"),("tspec", "INT", "NOT NULL")), ("aid","rank"), (("tnid","m_tag_name","tnid"),("aid","m_ast","aid"),("inneraid","m_ast","aid")), None, False, True)
 
 # TypeKind use values from TypeKind in cindex to store along with the name so that you can know wtf it is
-m_type_type = Table("m_type_type", (("typeid", "INT", "NOT NULL"),("tnid", "INT", "NOT NULL"),("typekind", "INT", "NOT NULL")), ("typeid",), (("typeid","m_type","typeid"),("tnid","m_tag_name","tnid")))
+m_ast_type = Table("m_ast_type", (("aid", "INT", "NOT NULL"),("tnid", "INT", "NOT NULL"),("typekind", "INT", "NOT NULL")), ("aid",), (("aid","m_ast","aid"),("tnid","m_tag_name","tnid")))
 
-m_tag = Table("m_tag", (("tgid", "INT", "NOT NULL", "AUTO_INCREMENT"),("tid", "INT", "NOT NULL"),("ttype", "TINYINT", "UNSIGNED", "NOT NULL"),("tnid", "INT", "NOT NULL"),("tspec", "INT", "NOT NULL"),("typeid", "INT")), ("tgid",), (("tid","m_time","tid"),("tnid","m_tag_name","tnid"),("typeid","m_type","typeid")), ((0,0,0,0,0,0),))
+m_tag = Table("m_tag", (("tgid", "INT", "NOT NULL", "AUTO_INCREMENT"),("tid", "INT", "NOT NULL"),("ttype", "TINYINT", "UNSIGNED", "NOT NULL"),("tnid", "INT", "NOT NULL"),("tspec", "INT", "NOT NULL"),("aid", "INT")), ("tgid",), (("tid","m_time","tid"),("tnid","m_tag_name","tnid"),("aid","m_ast","aid")), ((0,0,0,0,0,0),))
 
 #m_tag_content = Table("m_tag_content", (("tgid", "INT", "NOT NULL"),("rank", "INT", "NOT NULL"),("mtgid", "INT", "NOT NULL")), ("tgid","rank"), (("tgid","m_tag","tgid"),("mtgid","m_tag","tgid")), None, False, True)
 
@@ -874,13 +888,13 @@ def initialize_db():
 	m_tag_name.create_table()
 
 	print("Creating m_type")
-	m_type.create_table()
+	m_ast.create_table()
 
 	print("Creating m_type_struct")
-	m_type_struct.create_table()
+	m_ast_struct.create_table()
 
 	print("Creating m_type_type")
-	m_type_type.create_table()
+	m_ast_type.create_table()
 
 	print("Creating m_tag")
 	m_tag.create_table()
@@ -944,9 +958,7 @@ class Master_File:
 	def __init__(self):
 		self.version_dict = {}
 		self.file_dict = {}
-		# THIS IS BRAINDEAD RETARD SHIT, REMOVE IF NOT USED IN 3 STREAMS (12/24/2025)
-		self.to_be_cleared_dict = {}
-		self.to_be_cleared = {}
+
 
 	def add_version(self, version_name=None):
 		if version_name is None:
@@ -966,34 +978,8 @@ class Master_File:
 	def clear_all_version(self):
 		for item in self.version_dict:
 			shutil.rmtree(self.version_dict[item])
-
-		# THIS IS BRAINDEAD RETARD SHIT, REMOVE IF NOT USED IN 3 STREAMS (12/24/2025)
-		for item in self.to_be_cleared_dict:
-			shutil.rmtree(self.to_be_cleared_dict[item])
+# Maple's weirdest friend, Ned the Fox
 		return
-
-	# THIS IS BRAINDEAD RETARD SHIT, REMOVE IF NOT USED IN 3 STREAMS (12/24/2025)
-	def git_compile_make(self, version):
-		if self.to_be_cleared.get(version):
-			return self.to_be_cleared[version]
-		self.to_be_cleared_dict[version] = git_clone(version)
-		command = [
-			"make",
-			"-C",
-			f"{self.to_be_cleared_dict[version]}",
-			"allyesconfig"
-		]
-		sp.run(command)
-		self.to_be_cleared_dict[version] = git_clone(version)
-		command = [
-			"make",
-			"-C",
-			f"{self.to_be_cleared_dict[version]}",
-			"prepare"
-		]
-		sp.run(command)
-		self.to_be_cleared[version] = f"{self.to_be_cleared_dict[version]}/include/generated/autoconf.h"
-		return f"{self.to_be_cleared_dict[version]}/include/generated/autoconf.h"
 
 	def get_file(self, file_path, version=None):
 		if version is None:
@@ -1096,11 +1082,44 @@ class Master_File:
 
 		return sub_processing_list
 
+# 1. scan ifdefs, endif, if(latreretgfuhdfb ) ifndef
+# 2. STRCUT
+# 3. FUNCTION
+
+	def pre_parse(self, current_file):
+
+		# Cleanup
+		print(commentRemover(current_file))
+
+		emergency_shutdown()
+
+		current_file = removeComments(current_file).splitlines()
+
+		# ifdef only contains 1 thing at a time so they are stored in the db using type
+		p_ifdef = tuple(map(lambda y: y[6:].lstrip(), filter(lambda x: x.lstrip().startswith("#ifdef"), current_file)))
+
+		p_ifndef = tuple(filter(lambda x: x.lstrip().startswith("#ifndef"), current_file))
+		p_if = tuple(filter(lambda x: x.lstrip().startswith("#if"), current_file))
+		p_else = tuple(filter(lambda x: x.lstrip().startswith("#else"), current_file))
+		p_elsif = tuple(filter(lambda x: x.lstrip().startswith("#elsif"), current_file))
+		p_endif = tuple(filter(lambda x: x.lstrip().startswith("#endif"), current_file))
+
+		print(f"p_ifdef={p_ifdef}")
+		print(f"p_ifndef={p_ifndef}")
+		print(f"p_if={p_if}")
+		print(f"p_else={p_else}")
+		print(f"p_elsif={p_elsif}")
+		print(f"p_endif={p_endif}")
+
+		return p_ifdef
 
 	# include/linux/lockd/bind.h
 	def ast_type(self, file_path, version=None):
 		if version is None:
 			version=gp.version_name
+
+		current_file = self.get_file(file_path, version)
+		pre_parse_r = self.pre_parse(current_file)
 
 		# Initialize the Clang index
 		index = clang.cindex.Index.create()
@@ -1121,11 +1140,6 @@ class Master_File:
 			translation_unit.get_file(f"{mf.version_dict[version]}/{file_path}")
 		)
 
-		current_file = self.get_file(file_path, version).splitlines()
-
-		for line in current_file:
-			print("lolberg")
-
 
 		print("----")
 		for i in range(Skipped_ranges.contents.count):
@@ -1136,7 +1150,7 @@ class Master_File:
 			for x in current_file[Skipped_ranges.contents.ranges[i].start.line-1:Skipped_ranges.contents.ranges[i].end.line]:
 				print(x)
 
-		emergency_shutdown()
+
 		for include in translation_unit.get_includes():
 			print(include.source)
 
