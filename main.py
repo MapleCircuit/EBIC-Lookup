@@ -35,6 +35,97 @@ class CXSourceRangeList(ctypes.Structure):
 CXSourceRangeList_P = ctypes.POINTER(CXSourceRangeList)
 
 
+
+
+
+
+
+
+
+
+class Ast:
+	def __str__(self):
+		result = f"Class: {type(self).__name__} "
+		for key in vars(self):
+			result += f", {key} : {getattr(self, key)} "
+		return result
+
+
+
+
+class CPPro_ifdef(Ast):
+	def __init__(self, line_start, line_end, identifier):
+		self.line_start = line_start
+		self.line_end = line_end
+		self.identifier = identifier
+
+class CPPro_ifndef(Ast):
+	def __init__(self, line_start, line_end, identifier):
+		self.line_start = line_start
+		self.line_end = line_end
+		self.identifier = identifier
+
+class CPPro_if(Ast):
+	def __init__(self, line_start, line_end, expression):
+		self.line_start = line_start
+		self.line_end = line_end
+		self.expression = expression
+
+class CPPro_elif(Ast):
+	def __init__(self, line_start, line_end, expression):
+		self.line_start = line_start
+		self.line_end = line_end
+		self.expression = expression
+
+class CPPro_else(Ast):
+	def __init__(self, line_start, line_end):
+		self.line_start = line_start
+		self.line_end = line_end
+
+class CPPro_endif(Ast):
+	def __init__(self, line_start, line_end):
+		self.line_start = line_start
+		self.line_end = line_end
+
+class CPPro_define(Ast):
+	def __init__(self, line_start, line_end, identifier, replacement):
+		self.line_start = line_start
+		self.line_end = line_end
+		self.identifier = identifier
+		self.replacement = replacement
+
+class CPPro_undef(Ast):
+	def __init__(self, line_start, line_end, identifier):
+		self.line_start = line_start
+		self.line_end = line_end
+		self.identifier = identifier
+
+class CPPro_include(Ast):
+	def __init__(self, line_start, line_end, written_include, actual_include):
+		self.line_start = line_start
+		self.line_end = line_end
+		self.written_include = written_include
+		self.actual_include = actual_include
+
+class CPPro_line(Ast):
+	def __init__(self, line_start, line_end, lineno, filename):
+		self.line_start = line_start
+		self.line_end = line_end
+		self.lineno = lineno
+		self.filename = filename
+
+class CPPro_error(Ast):
+	def __init__(self, line_start, line_end, error_msg):
+		self.line_start = line_start
+		self.line_end = line_end
+		self.error_msg = error_msg
+
+class CPPro_pragma(Ast):
+	def __init__(self, line_start, line_end, pragma):
+		self.line_start = line_start
+		self.line_end = line_end
+		self.pragma = pragma
+
 ########https://gist.github.com/ChunMinChang/88bfa5842396c1fbbc5b
 def commentRemover(text):
 	def replacer(match):
@@ -1019,7 +1110,8 @@ class Master_File:
 			final_arr = []
 			for item in results:
 				try:
-					match item[9:10]:
+				#include 			 <my_aids.h­­>
+					match item[9]:
 						case "<":
 							temp_arr.append("include/" + item[10:item.find(">")])
 						case '"':
@@ -1086,23 +1178,190 @@ class Master_File:
 # 2. STRCUT
 # 3. FUNCTION
 
-	def pre_parse(self, current_file):
+	def preproparse(self, current_file, current_line, file_path):
+		working_line = current_file[current_line].lstrip()
+
+		loopval = 0
+		if working_line == "":
+			return
+		if working_line[0] != '#':
+			return
+
+		try:
+			working_line = working_line[0] + working_line[1:].lstrip()
+		except IndexError:
+			return
+
+
+		while current_file[current_line+loopval][-1] == "\\":
+
+			try:
+				current_file[current_line+loopval+1]
+			except IndexError:
+				break
+
+			loopval += 1
+			if (current_file[current_line+loopval][0] == " ") or (current_file[current_line+loopval][0] == "\t"):
+				working_line = working_line[:-1] + " \n" + current_file[current_line+loopval].lstrip()
+			else:
+				working_line = working_line[:-1] + "\n" + current_file[current_line+loopval]
+
+
+		if working_line.startswith("#ifdef"):
+			return CPPro_ifdef(current_line+1, current_line+1+loopval, working_line[6:].lstrip())
+
+		if working_line.startswith("#ifndef"):
+			return CPPro_ifndef(current_line+1, current_line+1+loopval, working_line[7:].lstrip())
+
+		if working_line.startswith("#if"):
+			return CPPro_if(current_line+1, current_line+1+loopval, working_line[3:].lstrip())
+
+		if working_line.startswith("#elifndef"):
+			print (f"SOME RETARDED DEVS, ADDED THIS FUCKING BULSHIT TO THEIR CODE: #elifndef , Line:{current_line+1}")
+			emergency_shutdown()
+		if working_line.startswith("#elifdef"):
+			print (f"SOME RETARDED DEVS, ADDED THIS FUCKING BULSHIT TO THEIR CODE: #elifdef , Line:{current_line+1}")
+			emergency_shutdown()
+
+		if working_line.startswith("#elif"):
+			return CPPro_elif(current_line+1, current_line+1+loopval, working_line[5:].lstrip())
+
+		if working_line.startswith("#else"):
+			return CPPro_else(current_line+1, current_line+1+loopval)
+
+		if working_line.startswith("#endif"):
+			return CPPro_endif(current_line+1, current_line+1+loopval)
+
+		if working_line.startswith("#define"):
+			working_line = working_line[7:].lstrip()
+			parentheses = 0
+			bypass = False
+			arg_one = ""
+			arg_two = ""
+			for line_char in working_line:
+				if not bypass:
+					if line_char == "\n":
+						continue
+					if line_char == '(':
+						parentheses += 1
+					elif (line_char == ' ') or (line_char == '\t'):
+						if parentheses == 0:
+							bypass = True
+					elif line_char == ')':
+						parentheses -= 1
+						if parentheses == 0:
+							bypass = True
+
+				if bypass:
+					arg_two += line_char
+				else:
+					arg_one += line_char
+
+
+			arg_two = arg_two.lstrip()
+			if arg_two == "":
+				arg_two = None
+
+			return CPPro_define(current_line+1, current_line+1+loopval, arg_one, arg_two)
+
+		if working_line.startswith("#undef"):
+			return CPPro_undef(current_line+1, current_line+1+loopval, working_line[6:].lstrip())
+
+
+
+		if working_line.startswith("#include"):
+			working_line = working_line[8:].lstrip()
+			if working_line == "":
+				return CPPro_include(current_line+1, current_line+1+loopval, "", "")
+
+			if working_line[0] == "\"":
+				written_include = "\""
+				actual_path = f"{Path(file_path).parent}/"
+				for line_char in working_line[1:]:
+					written_include += line_char
+					if line_char == "\"":
+						break
+			elif working_line[0] == "<":
+				written_include = "<"
+				actual_path = "include/"
+				for line_char in working_line[1:]:
+					written_include += line_char
+					if line_char == ">":
+						break
+			else:
+				return CPPro_include(current_line+1, current_line+1+loopval, "", "")
+
+
+			# PARSE THE ACTUAL INCLUDE
+			written_include[1:-2]
+
+			path_arr = []
+			dotdot = 0
+			# IT WILL FUCKING BREAK IF SOME RETARD PUT SOME ROOT PATH IN THERE LIBS, WHY WOULD SOMEONE DO SOMETHING SO WRONG???? WHO THE FUCJK KNOWS!!!! BEWARE
+			for chunk in str(actual_path + written_include[1:-1]).split("/")[::-1]:
+				if chunk == "..":
+					dotdot += 1
+				elif dotdot > 0:
+					dotdot -= 1
+				else:
+					path_arr.append(chunk)
+
+
+			return CPPro_include(current_line+1, current_line+1+loopval, written_include, "/".join(path_arr[::-1]))
+
+
+		if working_line.startswith("#line"):
+			line_in_work = working_line[5:].lstrip()
+
+			lineno = re.match(r'^\d+', line_in_work)
+
+			try:
+				filename = line_in_work[len(lineno):].lstrip()
+			except IndexError:
+				filename = None
+
+			return CPPro_line(current_line+1, current_line+1+loopval, int(lineno), filename)
+
+
+		if working_line.startswith("#error"):
+			return CPPro_error(current_line+1, current_line+1+loopval, working_line[6:].lstrip().rstrip())
+
+		if working_line.startswith("#pragma"):
+			return CPPro_pragma(current_line+1, current_line+1+loopval, working_line[7:].lstrip())
+
+
+		return
+
+
+
+	def pre_parse(self, current_file, file_path):
 
 		# Cleanup
-		print(commentRemover(current_file))
+		current_file = commentRemover(current_file).splitlines()
+
+		#fucjk = tuple(map(lambda x: self.preproparse(current_file, x[0], file_path), enumerate(current_file)))
+
+		bypass_num = 0
+		for shit in range(len(current_file)):
+			if shit<bypass_num:
+				continue
+			result = self.preproparse(current_file, shit, file_path)
+			if result:
+				if (temp := getattr(result, "line_end")) is not None:
+					bypass_num = temp
+				print(result)
 
 		emergency_shutdown()
-
-		current_file = removeComments(current_file).splitlines()
 
 		# ifdef only contains 1 thing at a time so they are stored in the db using type
 		p_ifdef = tuple(map(lambda y: y[6:].lstrip(), filter(lambda x: x.lstrip().startswith("#ifdef"), current_file)))
 
-		p_ifndef = tuple(filter(lambda x: x.lstrip().startswith("#ifndef"), current_file))
-		p_if = tuple(filter(lambda x: x.lstrip().startswith("#if"), current_file))
-		p_else = tuple(filter(lambda x: x.lstrip().startswith("#else"), current_file))
-		p_elsif = tuple(filter(lambda x: x.lstrip().startswith("#elsif"), current_file))
-		p_endif = tuple(filter(lambda x: x.lstrip().startswith("#endif"), current_file))
+		p_ifndef = tuple(map(lambda y: y[7:].lstrip(), filter(lambda x: x.lstrip().startswith("#ifndef"), current_file)))
+		#THIS DOPESNT FUCKING WORK ASFDBJGYDTCYHSBG DFHS
+		p_if = tuple(map(lambda y: y[3:].lstrip(), filter(lambda x: (x.lstrip().startswith("#if") and not x.lstrip().startswith("#ifndef")), current_file)))
+		p_else = tuple(map(lambda y: y[5:].lstrip(), filter(lambda x: x.lstrip().startswith("#else"), current_file)))
+		p_elsif = tuple(map(lambda y: y[6:].lstrip(), filter(lambda x: x.lstrip().startswith("#elsif"), current_file)))
+		p_endif = tuple(map(lambda y: y[6:].lstrip(), filter(lambda x: x.lstrip().startswith("#endif"), current_file)))
 
 		print(f"p_ifdef={p_ifdef}")
 		print(f"p_ifndef={p_ifndef}")
@@ -1110,7 +1369,6 @@ class Master_File:
 		print(f"p_else={p_else}")
 		print(f"p_elsif={p_elsif}")
 		print(f"p_endif={p_endif}")
-
 		return p_ifdef
 
 	# include/linux/lockd/bind.h
@@ -1119,7 +1377,7 @@ class Master_File:
 			version=gp.version_name
 
 		current_file = self.get_file(file_path, version)
-		pre_parse_r = self.pre_parse(current_file)
+		pre_parse_r = self.pre_parse(current_file, file_path)
 
 		# Initialize the Clang index
 		index = clang.cindex.Index.create()
